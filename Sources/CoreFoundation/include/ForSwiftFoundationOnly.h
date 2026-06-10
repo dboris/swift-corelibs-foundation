@@ -119,6 +119,9 @@ struct __CFSwiftObject {
 typedef struct __CFSwiftObject *CFSwiftRef;
 
 CF_EXPORT bool _CFIsSwift(CFTypeID type, CFSwiftRef obj);
+// HARMONY (ADR 0005): typeID-less variant -- true iff `obj` is a bridged
+// (foreign) object rather than a native CF instance. Tagged-pointer safe.
+CF_EXPORT bool _CFTypeIsSwift(CFTypeRef obj);
 CF_EXPORT void _CFDeinit(CFTypeRef cf);
 
 struct _NSObjectBridge {
