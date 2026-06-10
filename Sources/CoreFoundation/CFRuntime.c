@@ -722,17 +722,31 @@ CF_PRIVATE void __CFGenericValidateType_(CFTypeRef cf, CFTypeID type, const char
 // registered value in __CFRuntimeObjCClassTable. The info-derived typeID stays
 // as a fast path: a native object's real typeID slot matches its isa, and a
 // foreign isa can never match (only CF stamps registered isas onto instances).
+// True iff `isa` (or any of its ancestors) is a registered bridged class --
+// i.e. the instance is a CF-backed native. The ancestor walk matters for
+// isa-swizzled natives: KVO (NSKVOSwizzling.mm) retargets a native instance's
+// isa to a runtime-cloned subclass of the registered class, and zombies do the
+// same shape. The superclass pointer is word 1 of the libobjc2 class struct
+// (gnustep-2.0/3.0 and objc4 alike; asserted project-wide by the layout gate),
+// so the walk stays free of objc runtime calls.
+static Boolean __CFHarmonyIsBridgedNativeIsa(uintptr_t isa) {
+    for (int depth = 0; depth < 64 && isa != 0; depth++) {
+        for (CFTypeID idx = 1; idx < __CFRuntimeClassTableSize; idx++) {
+            uintptr_t reg = __CFISAForTypeID(idx);
+            if (reg != 0 && isa == reg) return true;
+        }
+        isa = ((const uintptr_t *)isa)[1];
+    }
+    return false;
+}
+
 CF_INLINE Boolean CFTYPE_IS_SWIFT(const void *obj) {
     if (((uintptr_t)obj & 0x7) != 0) return true;
     uintptr_t isa = ((const CFRuntimeBase *)obj)->_cfisa;
     if (isa == (uintptr_t)__CFConstantStringClassReferencePtr) return false;
     CFTypeID typeID = __CFGenericTypeID_inline(obj);
     if (typeID < __CFRuntimeClassTableSize && isa == __CFISAForTypeID(typeID)) return false;
-    for (CFTypeID idx = 1; idx < __CFRuntimeClassTableSize; idx++) {
-        uintptr_t reg = __CFISAForTypeID(idx);
-        if (reg != 0 && isa == reg) return false;
-    }
-    return true;
+    return !__CFHarmonyIsBridgedNativeIsa(isa);
 }
 
 // HARMONY: exported variant of the predicate above for the NS layer (replaces
@@ -1010,10 +1024,23 @@ CFHashCode CFHash(CFTypeRef cf) {
 }
 
 
+#if DEPLOYMENT_RUNTIME_SWIFT
+// HARMONY (ADR 0005): foreign objects answer -description (materialized to a
+// native CFString by the fill TU). The upstream table path below reads a
+// typeID the foreign object doesn't carry -- index 0's __CFNotATypeClass
+// HALTs. No __CFSwiftBridge slot exists for description, hence the extern.
+extern CFStringRef _CFHarmonyForeignCopyDescription(void *obj);
+#endif
+
 // definition: produces a normally non-NULL debugging description of the object
 CFStringRef CFCopyDescription(CFTypeRef cf) {
     if (NULL == cf) return NULL;
     // CFTYPE_OBJC_FUNCDISPATCH0(CFStringRef, cf, _copyDescription);  // XXX returns 0 refcounted item under GC
+#if DEPLOYMENT_RUNTIME_SWIFT
+    if (CFTYPE_IS_SWIFT(cf)) {
+        return _CFHarmonyForeignCopyDescription((void *)cf);
+    }
+#endif
     __CFGenericAssertIsCF(cf);
     if (NULL != __CFRuntimeClassTable[__CFGenericTypeID_inline(cf)]->copyDebugDesc) {
 	CFStringRef result = __CFRuntimeClassTable[__CFGenericTypeID_inline(cf)]->copyDebugDesc(cf);
@@ -1025,6 +1052,13 @@ CFStringRef CFCopyDescription(CFTypeRef cf) {
 // Definition: if type produces a formatting description, return that string, otherwise NULL
 CF_PRIVATE CFStringRef __CFCopyFormattingDescription(CFTypeRef cf, CFDictionaryRef formatOptions) {
     if (NULL == cf) return NULL;
+#if DEPLOYMENT_RUNTIME_SWIFT
+    // HARMONY: a foreign object has no CFRuntimeClass; returning NULL makes
+    // the %@ format path fall through to CFCopyDescription (-description).
+    if (CFTYPE_IS_SWIFT(cf)) {
+        return NULL;
+    }
+#endif
     __CFGenericAssertIsCF(cf);
     if (NULL != __CFRuntimeClassTable[__CFGenericTypeID_inline(cf)]->copyFormattingDesc) {
 	return __CFRuntimeClassTable[__CFGenericTypeID_inline(cf)]->copyFormattingDesc(cf, formatOptions);
@@ -1475,6 +1509,13 @@ extern void *_CFHarmonyForeignRetain(void *obj);
 extern void _CFHarmonyForeignRelease(void *obj);
 #endif
 
+// HARMONY: constant CF objects (kCFBoolean*, __CFConstStr statics, the
+// allocator singletons, ...) are _CF_CONSTANT_OBJECT_BACKING = const -- they
+// live in read-only pages with _swift_rc = _CF_CONSTANT_OBJECT_STRONG_RC
+// (top bit set). Like swift_retain's immortal check, never WRITE their
+// refcount word; mortal heap counts (starting at 1) can never set that bit.
+#define _CF_HARMONY_RC_IMMORTAL_BIT ((uintptr_t)1 << (sizeof(uintptr_t) * 8 - 1))
+
 // For "tryR==true", a return of NULL means "failed".
 static CFTypeRef _CFRetain(CFTypeRef cf, Boolean tryR) {
 #if DEPLOYMENT_RUNTIME_SWIFT
@@ -1482,7 +1523,11 @@ static CFTypeRef _CFRetain(CFTypeRef cf, Boolean tryR) {
     if (CFTYPE_IS_SWIFT(cf)) {
         return (CFTypeRef)_CFHarmonyForeignRetain((void *)cf);
     }
-    atomic_fetch_add_explicit((_Atomic(uintptr_t) *)&(((CFRuntimeBase *)cf)->_swift_rc), 1, memory_order_relaxed);
+    _Atomic(uintptr_t) *rc = (_Atomic(uintptr_t) *)&(((CFRuntimeBase *)cf)->_swift_rc);
+    if (atomic_load_explicit(rc, memory_order_relaxed) & _CF_HARMONY_RC_IMMORTAL_BIT) {
+        return cf;
+    }
+    atomic_fetch_add_explicit(rc, 1, memory_order_relaxed);
     return cf;
 #else
     // It's important to load a 64-bit value from cfinfo when running in 64 bit - if we only fetch 32 bits then it's possible we did not atomically fetch the deallocating/deallocated flag and the retain count together (19256102). Therefore it is after this load that we check the deallocating/deallocated flag and the const-ness.
@@ -1599,12 +1644,17 @@ static void _CFRelease(CFTypeRef CF_RELEASES_ARGUMENT cf) {
     // HARMONY (ADR 0005): see _CFRetain. Foreign objects release through the
     // libobjc2 runtime; native instances count down on `_swift_rc` and run the
     // CF finalizer + free at zero (the memory came from swift_allocObject,
-    // which is malloc-backed on this platform).
+    // which is malloc-backed on this platform). Constants are immortal and
+    // never written (read-only pages).
     if (CFTYPE_IS_SWIFT(cf)) {
         _CFHarmonyForeignRelease((void *)cf);
         return;
     }
-    uintptr_t prev = atomic_fetch_sub_explicit((_Atomic(uintptr_t) *)&(((CFRuntimeBase *)cf)->_swift_rc), 1, memory_order_release);
+    _Atomic(uintptr_t) *rc = (_Atomic(uintptr_t) *)&(((CFRuntimeBase *)cf)->_swift_rc);
+    if (atomic_load_explicit(rc, memory_order_relaxed) & _CF_HARMONY_RC_IMMORTAL_BIT) {
+        return;
+    }
+    uintptr_t prev = atomic_fetch_sub_explicit(rc, 1, memory_order_release);
     if (prev == 1) {
         atomic_thread_fence(memory_order_acquire);
         _CFDeinit(cf);
@@ -1886,7 +1936,18 @@ bool _CFIsSwift(CFTypeID type, CFSwiftRef obj) {
     // always bridged (foreign).
     if (((uintptr_t)obj & 0x7) != 0) return true;
     if (obj->isa == (uintptr_t)__CFConstantStringClassReferencePtr) return false;
-    return obj->isa != __CFRuntimeObjCClassTable[type];
+    if (obj->isa == __CFRuntimeObjCClassTable[type]) return false;
+    // HARMONY: isa-swizzled natives (KVO clones a subclass of the registered
+    // class and retargets the instance isa) are still CF-backed -- walk the
+    // superclass chain (word 1 of the libobjc2 class struct) for this type's
+    // registered class before declaring the object foreign.
+    uintptr_t registered = __CFRuntimeObjCClassTable[type];
+    uintptr_t isa = obj->isa;
+    for (int depth = 0; depth < 64 && isa != 0; depth++) {
+        if (isa == registered) return false;
+        isa = ((const uintptr_t *)isa)[1];
+    }
+    return true;
 }
 
 const char *_NSPrintForDebugger(void *cf) {
