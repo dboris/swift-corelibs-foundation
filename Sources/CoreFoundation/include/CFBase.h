@@ -643,6 +643,16 @@ CF_EXPORT
 void CFRelease(CFTypeRef cf);
 
 #if DEPLOYMENT_RUNTIME_SWIFT
+// HARMONY (ADR 0005): the WinObjC NS layer consumes CFAutorelease /
+// CFGetRetainCount as ordinary API at both seams. Both exist at SWIFT=1 on
+// this stack -- CFAutorelease is defined unconditionally in CFRuntime.c, and
+// CFGetRetainCount is provided by WinCatalyst's cf-swift-bridge-fill TU (on
+// Apple's SWIFT=1 builds the Swift overlay owns it, hence the upstream gate).
+CF_EXPORT
+CFTypeRef CFAutorelease(CFTypeRef CF_RELEASES_ARGUMENT arg);
+
+CF_EXPORT
+CFIndex CFGetRetainCount(CFTypeRef cf);
 #else
 CF_EXPORT
 CFTypeRef CFAutorelease(CFTypeRef CF_RELEASES_ARGUMENT arg) API_AVAILABLE(macos(10.9), ios(7.0), watchos(2.0), tvos(9.0));
