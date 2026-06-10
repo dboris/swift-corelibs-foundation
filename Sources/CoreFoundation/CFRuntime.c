@@ -319,9 +319,51 @@ CFTypeID _CFRuntimeRegisterClass(const CFRuntimeClass * const cls) {
     return typeID;
 }
 
+#if DEPLOYMENT_RUNTIME_SWIFT
+// HARMONY (6c.5, ADR 0005): dense side table of the DISTINCT classes
+// registered in __CFRuntimeObjCClassTable, so the foreign/native classifier
+// (__CFHarmonyIsBridgedNativeIsa below) scans a handful of entries instead of
+// the full __CFRuntimeClassTableSize-slot table PER ANCESTOR on every
+// foreign-object CF call.
+//
+// Writers append under __CFBigRuntimeFunnel (_CFRuntimeBridgeTypeToClass and
+// the __CFInitialize NSCFType seed are the only table writers). Classes are
+// never removed: nothing ever clears an ObjC-class-table slot, and
+// re-registration only ever specializes the seeded base class (which stays
+// registered for every other typeID), so the distinct-value set of the live
+// table and this array agree.
+//
+// Readers are lock-free: entries are append-only and the count is published
+// with release/acquire ordering, so a racing reader always sees a
+// fully-written prefix. On (impossible-in-practice) overflow the classifier
+// falls back to the exact full-table scan -- the stack registers ~10 distinct
+// classes against a capacity of 64.
+#define __CFHarmonyBridgedClassesCapacity 64
+static uintptr_t __CFHarmonyBridgedClasses[__CFHarmonyBridgedClassesCapacity];
+static _Atomic(uint32_t) __CFHarmonyBridgedClassCount;
+static _Atomic(bool) __CFHarmonyBridgedClassesOverflow;
+
+CF_PRIVATE void __CFHarmonyNoteBridgedClass(uintptr_t cls) {
+    if (cls == 0) return;
+    uint32_t count = atomic_load_explicit(&__CFHarmonyBridgedClassCount, memory_order_relaxed);
+    for (uint32_t i = 0; i < count; i++) {
+        if (__CFHarmonyBridgedClasses[i] == cls) return;
+    }
+    if (count == __CFHarmonyBridgedClassesCapacity) {
+        atomic_store_explicit(&__CFHarmonyBridgedClassesOverflow, true, memory_order_release);
+        return;
+    }
+    __CFHarmonyBridgedClasses[count] = cls;
+    atomic_store_explicit(&__CFHarmonyBridgedClassCount, count + 1, memory_order_release);
+}
+#endif
+
 void _CFRuntimeBridgeTypeToClass(CFTypeID cf_typeID, const void *cls_ref) {
     os_unfair_lock_lock(&__CFBigRuntimeFunnel);
     __CFRuntimeObjCClassTable[cf_typeID] = (uintptr_t)cls_ref;
+#if DEPLOYMENT_RUNTIME_SWIFT
+    __CFHarmonyNoteBridgedClass((uintptr_t)cls_ref);
+#endif
     os_unfair_lock_unlock(&__CFBigRuntimeFunnel);
 }
 
@@ -730,10 +772,25 @@ CF_PRIVATE void __CFGenericValidateType_(CFTypeRef cf, CFTypeID type, const char
 // (gnustep-2.0/3.0 and objc4 alike; asserted project-wide by the layout gate),
 // so the walk stays free of objc runtime calls.
 static Boolean __CFHarmonyIsBridgedNativeIsa(uintptr_t isa) {
+    // 6c.5: scan the dense distinct-class side table (maintained by
+    // __CFHarmonyNoteBridgedClass under the registration funnel) instead of
+    // the full __CFRuntimeClassTableSize-slot table per ancestor. The
+    // overflow fallback keeps the exact full-table semantics if the side
+    // table ever fills (it cannot in this stack; see the table's comment).
+    if (atomic_load_explicit(&__CFHarmonyBridgedClassesOverflow, memory_order_acquire)) {
+        for (int depth = 0; depth < 64 && isa != 0; depth++) {
+            for (CFTypeID idx = 1; idx < __CFRuntimeClassTableSize; idx++) {
+                uintptr_t reg = __CFISAForTypeID(idx);
+                if (reg != 0 && isa == reg) return true;
+            }
+            isa = ((const uintptr_t *)isa)[1];
+        }
+        return false;
+    }
+    uint32_t count = atomic_load_explicit(&__CFHarmonyBridgedClassCount, memory_order_acquire);
     for (int depth = 0; depth < 64 && isa != 0; depth++) {
-        for (CFTypeID idx = 1; idx < __CFRuntimeClassTableSize; idx++) {
-            uintptr_t reg = __CFISAForTypeID(idx);
-            if (reg != 0 && isa == reg) return true;
+        for (uint32_t i = 0; i < count; i++) {
+            if (__CFHarmonyBridgedClasses[i] == isa) return true;
         }
         isa = ((const uintptr_t *)isa)[1];
     }
@@ -1297,6 +1354,13 @@ void __CFInitialize(void) {
         extern uintptr_t __CFSwiftGetBaseClass(void);
 
         uintptr_t NSCFType = __CFSwiftGetBaseClass();
+        // HARMONY 6c.5: this seed writes __CFRuntimeObjCClassTable directly
+        // (not through _CFRuntimeBridgeTypeToClass), so note the base class
+        // in the classifier's dense side table here, under the same funnel
+        // the other writers hold.
+        os_unfair_lock_lock(&__CFBigRuntimeFunnel);
+        __CFHarmonyNoteBridgedClass(NSCFType);
+        os_unfair_lock_unlock(&__CFBigRuntimeFunnel);
         for (CFIndex idx = 1; idx < __CFRuntimeClassTableSize; idx++) {
             // HARMONY: don't clobber per-type registrations that already
             // happened -- the NS layer's +load _CFRuntimeBridgeTypeToClass
