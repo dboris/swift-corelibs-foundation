@@ -356,6 +356,50 @@ CF_PRIVATE void __CFHarmonyNoteBridgedClass(uintptr_t cls) {
     __CFHarmonyBridgedClasses[count] = cls;
     atomic_store_explicit(&__CFHarmonyBridgedClassCount, count + 1, memory_order_release);
 }
+
+#if defined(_WIN32)
+// HARMONY (ADR 0007 W2, Windows): every PE consumer MODULE carries its own
+// constant-string class anchor -- a CRT-init-promoted copy of the registered
+// string class under the _CF_CONSTANT_STRING_SWIFT_CLASS symbol name --
+// because a static initializer cannot reference imported data on PE.
+// Instances born with such a module-local isa ARE CF-backed natives
+// (__CFConstStr layouts), but the isa is neither the in-DLL constant-string
+// class nor in __CFRuntimeObjCClassTable, so without this note BOTH
+// classifiers call them foreign and the bridge thunks recurse into the
+// CF-backed NSString methods (objc_msgSend <-> CF ping-pong, stack
+// overflow). The note lands in TWO places: the per-type _CFIsSwift gets a
+// dedicated anchor list (its superclass walk only targets the type's
+// registered class, which a COPIED class struct never reaches), and the
+// type-erased CFTYPE_IS_SWIFT gets the bridged-class side table. Do NOT
+// enter anchors in __CFRuntimeObjCClassTable (one-class-per-type, ADR 0002).
+#define __CFHarmonyConstantStringAnchorCapacity 8
+static uintptr_t __CFHarmonyConstantStringAnchors[__CFHarmonyConstantStringAnchorCapacity];
+static _Atomic(uint32_t) __CFHarmonyConstantStringAnchorCount;
+
+CF_INLINE Boolean __CFHarmonyIsConstantStringAnchor(uintptr_t isa) {
+    uint32_t count = atomic_load_explicit(&__CFHarmonyConstantStringAnchorCount, memory_order_acquire);
+    for (uint32_t i = 0; i < count; i++) {
+        if (__CFHarmonyConstantStringAnchors[i] == isa) return true;
+    }
+    return false;
+}
+
+CF_EXPORT void _CFHarmonyNoteConstantStringAnchor(uintptr_t isa) {
+    if (isa == 0) return;
+    os_unfair_lock_lock(&__CFBigRuntimeFunnel);
+    __CFHarmonyNoteBridgedClass(isa);
+    uint32_t count = atomic_load_explicit(&__CFHarmonyConstantStringAnchorCount, memory_order_relaxed);
+    Boolean present = false;
+    for (uint32_t i = 0; i < count; i++) {
+        if (__CFHarmonyConstantStringAnchors[i] == isa) { present = true; break; }
+    }
+    if (!present && count < __CFHarmonyConstantStringAnchorCapacity) {
+        __CFHarmonyConstantStringAnchors[count] = isa;
+        atomic_store_explicit(&__CFHarmonyConstantStringAnchorCount, count + 1, memory_order_release);
+    }
+    os_unfair_lock_unlock(&__CFBigRuntimeFunnel);
+}
+#endif
 #endif
 
 void _CFRuntimeBridgeTypeToClass(CFTypeID cf_typeID, const void *cls_ref) {
@@ -2019,6 +2063,12 @@ bool _CFIsSwift(CFTypeID type, CFSwiftRef obj) {
     // always bridged (foreign).
     if (((uintptr_t)obj & 0x7) != 0) return true;
     if (obj->isa == (uintptr_t)__CFConstantStringClassReferencePtr) return false;
+#if defined(_WIN32)
+    // HARMONY (ADR 0007 W2): PE consumer modules carry module-local
+    // constant-string class anchors -- those isas are constant-string
+    // classes too (see _CFHarmonyNoteConstantStringAnchor above).
+    if (__CFHarmonyIsConstantStringAnchor(obj->isa)) return false;
+#endif
     if (obj->isa == __CFRuntimeObjCClassTable[type]) return false;
     // HARMONY: isa-swizzled natives (KVO clones a subclass of the registered
     // class and retargets the instance isa) are still CF-backed -- walk the
