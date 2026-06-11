@@ -499,13 +499,32 @@ CFTypeRef _CFRuntimeCreateInstance(CFAllocatorRef allocator, CFTypeID typeID, CF
     // through the overalign'ed path.  This may result in a cross-domainf free
     // and a resultant heap corruption.
     size_t align = (cls->version & _kCFRuntimeRequiresAlignment) ? cls->requiredAlignment : kDefaultAlignment;
-    
+
+#if defined(_WIN32)
+    // HARMONY (ADR 0007 W2): do NOT allocate through swift_allocObject on
+    // Windows. It mallocs inside swiftCore.dll -- a DIFFERENT CRT heap from
+    // this DLL's (debug) CRT -- and the Harmony release path frees with this
+    // DLL's free() at zero, so every native CF instance died in a cross-DLL
+    // free (debug-CRT abort inside __CFInitialize was the first symptom; one
+    // process-wide allocator on Linux/ELF makes this unobservable there).
+    // The Harmony seam never relies on swift HeapObject properties of CF
+    // instances (_swift_rc is a plain counter; isa is stamped explicitly),
+    // so CRT-local calloc + free is the correct pairing here.
+    (void)align;
+    CFRuntimeBase *memory = (CFRuntimeBase *)calloc(1, size);
+    if (NULL == memory) {
+        return NULL;
+    }
+    memory->_cfisa = isa;
+    memory->_swift_rc = 1;
+#else
     CFRuntimeBase *memory = (CFRuntimeBase *)swift_allocObject(isa, size, align - 1);
 
     // HARMONY (ADR 0005): `_swift_rc` is a plain refcount on this stack (see
     // _CFRetain/_CFRelease above) -- replace swift_allocObject's InlineRefCounts
     // bit pattern with an explicit count of 1.
     memory->_swift_rc = 1;
+#endif
 
     // Zero the rest of the memory, starting at cfinfo
     memset(&memory->_cfinfoa, 0, size - (sizeof(memory->_cfisa) + sizeof(memory->_swift_rc)));
