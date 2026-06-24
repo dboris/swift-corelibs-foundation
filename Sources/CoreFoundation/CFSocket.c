@@ -1507,7 +1507,13 @@ static void *__CFSocketManager(void * arg)
             manageSelectError(error);
             continue;
         }
-        if (FD_ISSET(__CFWakeupSocketPair[1], readfds)) {
+        // Guard the wakeup-socket test the way every other FD_ISSET in this
+        // manager does (0 <= sock). __CFWakeupSocketPair[1] is INVALID_SOCKET(-1)-
+        // initialized and stays -1 if the socketpair/INET-fallback init failed; on
+        // bionic (Android) FD_ISSET is fortified and aborts the process on a
+        // negative fd ("FORTIFY: FD_ISSET: file descriptor -1 < 0"), where glibc
+        // merely returns. Skip the unusable wakeup socket instead of aborting.
+        if (INVALID_SOCKET != __CFWakeupSocketPair[1] && FD_ISSET(__CFWakeupSocketPair[1], readfds)) {
             recv(__CFWakeupSocketPair[1], (char *)buffer, sizeof(buffer), 0);
             __CFSOCKETLOG("socket manager received %c on wakeup socket\n", buffer[0]);
         }
