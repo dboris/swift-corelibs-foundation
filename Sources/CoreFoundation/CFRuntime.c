@@ -1784,6 +1784,17 @@ static void _CFRelease(CFTypeRef CF_RELEASES_ARGUMENT cf) {
     uintptr_t prev = atomic_fetch_sub_explicit(rc, 1, memory_order_release);
     if (prev == 1) {
         atomic_thread_fence(memory_order_acquire);
+        // Guard against re-entrant deallocation. A finalizer may CFRetain/CFRelease
+        // `self` in a balanced bracket -- the canonical case is CFRunLoopSource:
+        // __CFRunLoopSourceDeallocate calls CFRunLoopSourceInvalidate, which wraps
+        // its work in CFRetain(rls)...CFRelease(rls). With a plain counter at zero,
+        // that trailing release would drive _swift_rc 1->0 and re-enter _CFDeinit,
+        // recursing infinitely and double-freeing. The non-Swift path uses
+        // RC_DEALLOCATING_BIT for this; here we pin the count to a high sentinel
+        // across _CFDeinit so any balanced retain/release during finalization can
+        // never reach zero again. We free unconditionally afterwards (resurrection
+        // is a client bug Apple's CF doesn't honor either).
+        atomic_store_explicit(rc, (uintptr_t)1 << (sizeof(uintptr_t) * 8 - 2), memory_order_relaxed);
         _CFDeinit(cf);
         free((void *)cf);
     }
