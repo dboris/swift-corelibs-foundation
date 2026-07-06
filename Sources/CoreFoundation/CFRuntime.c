@@ -957,8 +957,17 @@ CFTypeRef CFRetain(CFTypeRef cf) {
     return _CFRetain(cf, false);
 }
 
+// WINCATALYST CFAutorelease migration, slice 1 (audit). Seam into the audit
+// engine (Frameworks/CoreFoundation/stubs/cf-autorelease-audit.mm, same static
+// lib). __wcCFAutoreleaseAuditEnabled is BSS-zeroed (0=off) before any dynamic
+// init, so the shipped default is one relaxed int-load and no call. See
+// docs/handoffs/2026-07-06-cfautorelease-migration-scope.md + lesson #135.
+extern int  __wcCFAutoreleaseAuditEnabled;
+extern void __wcCFAutoreleaseAuditOnAutorelease(CFTypeRef cf);
+
 CFTypeRef CFAutorelease(CFTypeRef __attribute__((cf_consumed)) cf) {
     if (NULL == cf) { CRSetCrashLogMessage("*** CFAutorelease() called with NULL ***"); HALT; }
+    if (__wcCFAutoreleaseAuditEnabled) { __wcCFAutoreleaseAuditOnAutorelease(cf); }
     return cf;
 }
 
