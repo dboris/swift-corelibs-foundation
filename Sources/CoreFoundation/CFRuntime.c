@@ -957,17 +957,27 @@ CFTypeRef CFRetain(CFTypeRef cf) {
     return _CFRetain(cf, false);
 }
 
-// WINCATALYST CFAutorelease migration, slice 1 (audit). Seam into the audit
-// engine (Frameworks/CoreFoundation/stubs/cf-autorelease-audit.mm, same static
-// lib). __wcCFAutoreleaseAuditEnabled is BSS-zeroed (0=off) before any dynamic
-// init, so the shipped default is one relaxed int-load and no call. See
+// WINCATALYST CFAutorelease migration. Seam into the migration engine
+// (Frameworks/CoreFoundation/stubs/cf-autorelease-audit.mm, same static lib).
+// Both flags are BSS-zeroed (0=off) before any dynamic init, so the shipped
+// default is two relaxed int-loads and no call. The engine's file-scope
+// initializer reads WINCAT_CF_AUTORELEASE={off|audit|real} once and enables at
+// most one arm (mutually exclusive). See
 // docs/handoffs/2026-07-06-cfautorelease-migration-scope.md + lesson #135.
+//   audit (slice 1): CFRetain-hold + retain-count classification, drain-free.
+//   real  (slice 2): objc_autorelease((id)cf) -- a real pool claim (freed at the
+//                    enclosing pool's pop via -release -> CFRelease). The claim +
+//                    the DLL-init reentry guard live in the engine TU, not here,
+//                    to keep objc_autorelease out of this C file.
 extern int  __wcCFAutoreleaseAuditEnabled;
 extern void __wcCFAutoreleaseAuditOnAutorelease(CFTypeRef cf);
+extern int  __wcCFAutoreleaseRealEnabled;
+extern void __wcCFAutoreleaseRealClaim(CFTypeRef cf);
 
 CFTypeRef CFAutorelease(CFTypeRef __attribute__((cf_consumed)) cf) {
     if (NULL == cf) { CRSetCrashLogMessage("*** CFAutorelease() called with NULL ***"); HALT; }
     if (__wcCFAutoreleaseAuditEnabled) { __wcCFAutoreleaseAuditOnAutorelease(cf); }
+    if (__wcCFAutoreleaseRealEnabled)  { __wcCFAutoreleaseRealClaim(cf); }
     return cf;
 }
 
