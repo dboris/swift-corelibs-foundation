@@ -295,9 +295,53 @@ Boolean _CFIsObjC(CFTypeID typeID, void *obj) {
     return CF_IS_OBJC(typeID, obj);
 }
 
+// HARMONY: forward declaration of the initializer so the entry points below can FORCE
+// it. It must repeat the platform-conditional linkage of the real declaration further
+// down this file (static + constructor on ELF, CF_EXPORT elsewhere), or the
+// definition's linkage changes.
+#if DEPLOYMENT_RUNTIME_SWIFT
+#if TARGET_OS_LINUX || TARGET_OS_BSD || TARGET_OS_WASI
+static void __CFInitialize(void) __attribute__ ((constructor));
+#else
+CF_EXPORT void __CFInitialize(void);
+#endif
+
+// HARMONY: CF's ELF initializer is a PLAIN `__attribute__((constructor))`, so an ObjC
+// `+load` / `+initialize` living in another object file can run BEFORE it -- ELF
+// constructor order across a static archive is link-order dependent. Windows already
+// defends against precisely this: DllMain and __CFWindowsExecutableInitializer call
+// __CFInitialize() explicitly, with the comment "to avoid issues with static
+// initializer ordering". ELF had no equivalent, which is why the bug below was
+// Linux-only despite identical sources.
+//
+// What went wrong without it (measured on WinCatalyst's uikitcollection gate):
+// `+[UISegment initialize]` asks for `+[UIColor blueColor]` during class realization,
+// which builds the process-wide CGColorSpace singleton through
+// _CFRuntimeCreateInstance -- BEFORE __CFInitialize has seeded
+// __CFRuntimeObjCClassTable with the NSCFType base class. The instance is therefore
+// stamped `_cfisa = 0` and cached in a function-local static forever, while every
+// later __CFISAForTypeID() for its typeID answers NSCFType. CFTYPE_IS_SWIFT then sees
+// isa(0) != NSCFType, concludes "foreign", and routes CFRetain into objc_retain, which
+// dereferences the null isa: SIGSEGV inside objc_class_is_swift, arbitrarily far from
+// the cause (here, much later, inside -[UIScrollView layoutSubviews]).
+//
+// Re-entrant BY DESIGN: __CFInitialize itself registers classes and creates instances,
+// and its own `if (!__CFInitialized && !__CFInitializing)` guard makes those nested
+// calls no-ops. Cheap enough to sit on these paths -- in the steady state it is one
+// load of an already-set flag.
+CF_INLINE void __CFHarmonyEnsureInitialized(void) {
+    if (!__CFInitialized) {
+        __CFInitialize();
+    }
+}
+#else
+CF_INLINE void __CFHarmonyEnsureInitialized(void) {}
+#endif
+
 CFTypeID _CFRuntimeRegisterClass(const CFRuntimeClass * const cls) {
     // NOTE: If you are adding a type to CF itself, please use a constant value (see CFRuntime_Internal.h)
 // className must be pure ASCII string, non-null
+    __CFHarmonyEnsureInitialized();
     if ((cls->version & _kCFRuntimeCustomRefCount) && !cls->refcount) {
        CFLog(kCFLogLevelWarning, CFSTR("*** _CFRuntimeRegisterClass() given inconsistent class '%s'.  Program will crash soon."), cls->className);
        return _kCFRuntimeNotATypeID;
@@ -523,7 +567,11 @@ CF_INLINE CFRuntimeBase *_cf_aligned_calloc(size_t align, CFIndex size, const ch
 CFTypeRef _CFRuntimeCreateInstance(CFAllocatorRef allocator, CFTypeID typeID, CFIndex extraBytes, unsigned char *category) {
 #if DEPLOYMENT_RUNTIME_SWIFT
     // Under the Swift runtime, all CFTypeRefs are _NSCFTypes or a toll-free bridged type
-    
+
+    // HARMONY: the isa read below is the one that must not happen against an unseeded
+    // __CFRuntimeObjCClassTable -- see __CFHarmonyEnsureInitialized.
+    __CFHarmonyEnsureInitialized();
+
     extern  void *swift_allocObject(uintptr_t metadata, size_t requiredSize, size_t requiredAlignmentMask);
     uintptr_t isa = __CFRuntimeObjCClassTable[typeID];
     CFIndex size = sizeof(CFRuntimeBase) + extraBytes;
@@ -863,6 +911,16 @@ static Boolean __CFHarmonyIsBridgedNativeIsa(uintptr_t isa) {
 CF_INLINE Boolean CFTYPE_IS_SWIFT(const void *obj) {
     if (((uintptr_t)obj & 0x7) != 0) return true;
     uintptr_t isa = ((const CFRuntimeBase *)obj)->_cfisa;
+    // HARMONY: a NULL isa is never an ObjC/Swift object, so it is always CF-native.
+    // Without this the fall-through below answers "foreign" for such an object (the
+    // bridged-isa scan trivially fails to match 0), and CFRetain/CFRelease then hand it
+    // to objc_retain, which dereferences the null isa. __CFHarmonyEnsureInitialized
+    // closes the window that produced these for CLIENT code; this closes the residual
+    // one, because __CFInitialize creates CF instances of its own BEFORE it reaches the
+    // NSCFType seed, and those are stamped `_cfisa = 0` however early the initializer
+    // runs. Unconditionally true rather than a workaround: nothing legitimately owns a
+    // null isa.
+    if (isa == 0) return false;
     if (isa == (uintptr_t)__CFConstantStringClassReferencePtr) return false;
     CFTypeID typeID = __CFGenericTypeID_inline(obj);
     if (typeID < __CFRuntimeClassTableSize && isa == __CFISAForTypeID(typeID)) return false;
@@ -2092,6 +2150,13 @@ bool _CFIsSwift(CFTypeID type, CFSwiftRef obj) {
     // carry no isa word -- classify BEFORE dereferencing. Tagged objects are
     // always bridged (foreign).
     if (((uintptr_t)obj & 0x7) != 0) return true;
+    // HARMONY: a NULL isa is never an ObjC/Swift object -- always CF-native. Same
+    // invariant, and the same crash if omitted, as the guard in CFTYPE_IS_SWIFT: an
+    // instance created before __CFInitialize seeded __CFRuntimeObjCClassTable carries
+    // `_cfisa = 0`, the registered-class comparison below then fails, the superclass
+    // walk cannot even start (its condition is `isa != 0`), and this returns "foreign"
+    // -- sending the object into objc_retain, which dereferences the null isa.
+    if (obj->isa == 0) return false;
     if (obj->isa == (uintptr_t)__CFConstantStringClassReferencePtr) return false;
 #if defined(_WIN32)
     // HARMONY (ADR 0007 W2): PE consumer modules carry module-local
