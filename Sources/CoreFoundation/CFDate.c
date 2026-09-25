@@ -78,11 +78,14 @@ CF_PRIVATE uint64_t __CFTSRToNanoseconds(uint64_t tsr) {
 
 #if TARGET_OS_WIN32
 CFAbsoluteTime CFAbsoluteTimeGetCurrent(void) {
-    SYSTEMTIME stTime;
     FILETIME ftTime;
 
-    GetSystemTime(&stTime);
-    SystemTimeToFileTime(&stTime, &ftTime);
+    // GetSystemTime fills a SYSTEMTIME, which carries only milliseconds;
+    // consecutive calls then share a timestamp, so anything ordered by
+    // "now" with a strict comparison misorders. The precise variant keeps
+    // the full 100ns FILETIME resolution (Windows 8+), matching the
+    // sub-millisecond clock the other platforms read via gettimeofday.
+    GetSystemTimePreciseAsFileTime(&ftTime);
 
     // 100ns intervals since NT Epoch
     uint64_t result = ((uint64_t)ftTime.dwHighDateTime << 32)
