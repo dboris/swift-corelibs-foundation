@@ -146,6 +146,13 @@ CF_INLINE void __CFSetMutableVariety(void *cf, _CFDataMutableVariety v) {
     __CFRuntimeSetValue(cf, 1, 0, v);
 }
 
+// The bytes belong to the CFData (inline, or allocated by it) rather than to a
+// caller who handed them over with a deallocator: the test CFDataCreateCopy uses
+// to decide that an immutable data may be retained instead of copied.
+CF_INLINE Boolean __CFDataOwnsBuffer(CFDataRef data) {
+    return __CFDataBytesInline(data) || (data->_bytesDeallocator == NULL);
+}
+
 CF_INLINE Boolean __CFDataNeedsToZero(CFDataRef data) {
     return __CFRuntimeGetFlag(data, __kCFNeedsZero);
 }
@@ -470,7 +477,7 @@ CFDataRef CFDataCreateCopy(CFAllocatorRef allocator, CFDataRef data) {
             CFAllocatorRef const effectiveDataAllocator = __CFDataUseAllocator(data) ? __CFGetAllocator(data) : NULL;
             if (effectiveCopyAllocator == effectiveDataAllocator) {
                 // ... and the buffer is owned by the CFData.
-                if (__CFDataBytesInline(data) || (data->_bytesDeallocator == NULL)) {
+                if (__CFDataOwnsBuffer(data)) {
 
                     // Then just retain instead of making a true copy
                     return CFRetain(data);
@@ -504,6 +511,24 @@ CFIndex CFDataGetLength(CFDataRef data) {
     CF_SWIFT_NSDATA_FUNCDISPATCHV(_kCFRuntimeIDCFData, CFIndex, data, NSData.length);
     __CFGenericValidateType(data, CFDataGetTypeID());
     return __CFDataLength(data);
+}
+
+// These two functions are for Foundation's benefit; no one else should use them.
+// HARMONY: WinCatalyst's NSCFData guards its mutators with the first, and retains
+// rather than copies an immutable data in -copyWithZone: only when the second
+// holds (CFDataCreateCopy's own rule). Same shape as _CFDictionaryIsMutable.
+CF_EXPORT Boolean _CFDataIsMutable(CFDataRef data) {
+    if (CF_IS_SWIFT(_kCFRuntimeIDCFData, data)) return false;
+    if (CF_IS_OBJC(_kCFRuntimeIDCFData, data)) return false;
+    __CFGenericValidateType(data, CFDataGetTypeID());
+    return __CFDataIsMutable(data);
+}
+
+CF_EXPORT Boolean _CFDataOwnsBuffer(CFDataRef data) {
+    if (CF_IS_SWIFT(_kCFRuntimeIDCFData, data)) return false;
+    if (CF_IS_OBJC(_kCFRuntimeIDCFData, data)) return false;
+    __CFGenericValidateType(data, CFDataGetTypeID());
+    return __CFDataOwnsBuffer(data);
 }
 
 CF_PRIVATE uint8_t *_CFDataGetBytePtrNonObjC(CFDataRef data) {

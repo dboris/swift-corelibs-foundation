@@ -303,6 +303,16 @@ CFStringRef CFAttributedStringGetString(CFAttributedStringRef attrStr) {
     return attrStr->string;
 }
 
+// This function is for Foundation's benefit; no one else should use it.
+// HARMONY: the immutability guard of WinCatalyst's NSCFAttributedString mutators.
+// Same shape as _CFDictionaryIsMutable.
+CF_EXPORT Boolean _CFAttributedStringIsMutable(CFAttributedStringRef attrStr) {
+    if (CF_IS_SWIFT(_kCFRuntimeIDCFAttributedString, attrStr)) return false;
+    if (CF_IS_OBJC(_kCFRuntimeIDCFAttributedString, attrStr)) return false;
+    __CFAssertIsAttributedString(attrStr);
+    return __CFAttributedStringIsMutable(attrStr);
+}
+
 CFIndex CFAttributedStringGetLength(CFAttributedStringRef attrStr) {
     CF_OBJC_FUNCDISPATCHV(CFAttributedStringGetTypeID(), CFIndex, (NSAttributedString *)attrStr, length);
     __CFAssertIsAttributedString(attrStr);
