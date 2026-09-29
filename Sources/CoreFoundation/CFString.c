@@ -2110,6 +2110,17 @@ CFIndex _CFStringGetLength2(CFStringRef str) {
     return __CFStrLength(str);
 }
 
+// This function is for Foundation's benefit; no one else should use it.
+// HARMONY: the immutability guard of WinCatalyst's NSCFString mutators (CF's own
+// mutators only log "Expect mutable string" and return, where Foundation must
+// raise). Same shape as _CFDictionaryIsMutable.
+CF_EXPORT Boolean _CFStringIsMutable(CFStringRef str) {
+    if (CF_IS_SWIFT(_kCFRuntimeIDCFString, str)) return false;
+    if (CF_IS_OBJC(_kCFRuntimeIDCFString, str)) return false;
+    __CFAssertIsString(str);
+    return __CFStrIsMutable(str);
+}
+
 
 /* Guts of CFStringGetCharacterAtIndex(); called from the two functions below. Don't call it from elsewhere.
 */

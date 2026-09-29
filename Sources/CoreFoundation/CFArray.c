@@ -544,6 +544,17 @@ void CFArrayGetValues(CFArrayRef array, CFRange range, const void **values) {
     }
 }
 
+// This function is for Foundation's benefit; no one else should use it.
+// HARMONY: the immutability guard of WinCatalyst's NSCFArray mutators. An
+// immutable array stores its values inline, exactly sized, so a mutation that got
+// past it would write past the allocation. Same shape as _CFDictionaryIsMutable.
+CF_EXPORT Boolean _CFArrayIsMutable(CFArrayRef array) {
+    if (CF_IS_SWIFT(_kCFRuntimeIDCFArray, array)) return false;
+    if (CF_IS_OBJC(_kCFRuntimeIDCFArray, array)) return false;
+    __CFGenericValidateType(array, CFArrayGetTypeID());
+    return __CFArrayGetType(array) != __kCFArrayImmutable;
+}
+
 CF_EXPORT unsigned long _CFArrayFastEnumeration(CFArrayRef array, struct __objcFastEnumerationStateEquivalent *state, void *stackbuffer, unsigned long count) {
     CHECK_FOR_MUTATION(array);
     if (array->_count == 0) return 0;
