@@ -1562,11 +1562,17 @@ CFStringRef CFTimeZoneCopyAbbreviation(CFTimeZoneRef tz, CFAbsoluteTime at) {
     UCalendarDisplayNameType nameType = ucal_inDaylightTime(ucal, &status) ? UCAL_SHORT_DST : UCAL_SHORT_STANDARD;
     UChar buffer[64];
     int32_t length;
-    length = ucal_getTimeZoneDisplayName(ucal, nameType, "C", buffer, sizeof(buffer), &status);
+    // The capacity is in UChars, not bytes: sizeof(buffer) let ICU write
+    // twice the buffer.
+    const int32_t capacity = sizeof(buffer) / sizeof(buffer[0]);
+    length = ucal_getTimeZoneDisplayName(ucal, nameType, "C", buffer, capacity, &status);
 
     ucal_close(ucal);
 
-    return length <= sizeof(buffer) ? CFStringCreateWithCharacters(kCFAllocatorSystemDefault, buffer, length) : NULL;
+    if (U_FAILURE(status) || length > capacity) {
+        return NULL;
+    }
+    return CFStringCreateWithCharacters(kCFAllocatorSystemDefault, buffer, length);
 #else
     idx = __CFBSearchTZPeriods(tz, at);
     result = __CFTZPeriodAbbreviation(&(tz->_periods[idx]));
@@ -1585,7 +1591,8 @@ Boolean CFTimeZoneIsDaylightSavingTime(CFTimeZoneRef tz, CFAbsoluteTime at) {
     ucal_setMillis(ucal, (at + kCFAbsoluteTimeIntervalSince1970) * 1000.0, &status);
 
     UBool isDaylightTime = ucal_inDaylightTime(ucal, &status);
-    return isDaylightTime ? TRUE : FALSE;
+    ucal_close(ucal);
+    return (U_SUCCESS(status) && isDaylightTime) ? TRUE : FALSE;
 #else
     CFIndex idx;
     idx = __CFBSearchTZPeriods(tz, at);
@@ -1619,11 +1626,17 @@ CFAbsoluteTime CFTimeZoneGetNextDaylightSavingTimeTransition(CFTimeZoneRef tz, C
     }
     ucal_setMillis(ucal, (at + kCFAbsoluteTimeIntervalSince1970) * 1000.0, &status);
 
-    UDate date;
-    ucal_getTimeZoneTransitionDate(ucal, UCAL_TZ_TRANSITION_NEXT, &date, &status);
+    UDate date = 0.0;
+    UBool found = ucal_getTimeZoneTransitionDate(ucal, UCAL_TZ_TRANSITION_NEXT, &date, &status);
 
     ucal_close(ucal);
 
+    // A zone with no next transition (UTC, GMT, a fixed offset, a zone whose
+    // DST rules ended) makes ICU return FALSE and leave `date` unwritten;
+    // 0.0 is CF's "no transition", as in the non-Windows arm.
+    if (!found || U_FAILURE(status)) {
+        return 0.0;
+    }
     return (date / 1000.0) - kCFAbsoluteTimeIntervalSince1970;
 #else
     CFIndex idx = __CFBSearchTZPeriods(tz, at);
