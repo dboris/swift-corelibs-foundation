@@ -64,6 +64,15 @@
 
 extern void __CFGetUGIDs(uid_t *euid, gid_t *egid);
 
+// Harmony: upstream 27283b74 ("Use FileManager API to get current working directory", 6.4)
+// moved _CFGetCurrentDirectory into Swift Foundation (FileManager.swift, @_cdecl). This
+// stack has no Swift Foundation -- WinCatalyst's Objective-C Foundation sits on CF -- so
+// CFURL's _CFURLCreateCurrentDirectoryURL lost its only provider and every CF consumer link
+// failed on it. Restore the 6.3.2 C definition, verbatim; CFInternal.h still declares it.
+CF_PRIVATE Boolean _CFGetCurrentDirectory(char *path, int maxlen) {
+    return getcwd(path, maxlen) != NULL;
+}
+
 #if TARGET_OS_MAC
 // CoreGraphics and LaunchServices are only projects (1 Dec 2006) that use these
 char **_CFArgv(void) { return *_NSGetArgv(); }
