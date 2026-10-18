@@ -569,9 +569,12 @@ _stat_with_btime(const char *filename, struct stat *buffer, struct timespec *bti
             .st_uid = statx_buffer.stx_uid,
             .st_gid = statx_buffer.stx_gid,
             .st_rdev = makedev(statx_buffer.stx_rdev_major, statx_buffer.stx_rdev_minor),
-            .st_size = statx_buffer.stx_size,
+            // Harmony: explicit (off_t)/(blkcnt_t) -- clang 21 diagnoses C++11 narrowing inside a C compound
+            // literal too, and this header is included by C++ TUs (WinCatalyst CoreGraphics/Skia); stx_size and
+            // stx_blocks are __u64 while the LP64 fields are long -- same width, so the casts change nothing.
+            .st_size = (off_t)statx_buffer.stx_size,
             .st_blksize = statx_buffer.stx_blksize,
-            .st_blocks = statx_buffer.stx_blocks,
+            .st_blocks = (blkcnt_t)statx_buffer.stx_blocks,
             .st_atim = { .tv_sec = statx_buffer.stx_atime.tv_sec, .tv_nsec = statx_buffer.stx_atime.tv_nsec },
             .st_mtim = { .tv_sec = statx_buffer.stx_mtime.tv_sec, .tv_nsec = statx_buffer.stx_mtime.tv_nsec },
             .st_ctim = { .tv_sec = statx_buffer.stx_ctime.tv_sec, .tv_nsec = statx_buffer.stx_ctime.tv_nsec },
