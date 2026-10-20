@@ -569,12 +569,15 @@ _stat_with_btime(const char *filename, struct stat *buffer, struct timespec *bti
             .st_uid = statx_buffer.stx_uid,
             .st_gid = statx_buffer.stx_gid,
             .st_rdev = makedev(statx_buffer.stx_rdev_major, statx_buffer.stx_rdev_minor),
-            // Harmony: explicit (off_t)/(blkcnt_t) -- clang 21 diagnoses C++11 narrowing inside a C compound
-            // literal too, and this header is included by C++ TUs (WinCatalyst CoreGraphics/Skia); stx_size and
-            // stx_blocks are __u64 while the LP64 fields are long -- same width, so the casts change nothing.
-            .st_size = (off_t)statx_buffer.stx_size,
+            // Harmony: explicit casts to each FIELD's own type -- clang 21 diagnoses C++11 narrowing inside a C
+            // compound literal too, and this header is included by C++ TUs (WinCatalyst CoreGraphics/Skia);
+            // stx_size and stx_blocks are __u64 while the LP64 fields are signed -- same width, so the casts
+            // change nothing. Spelled with __typeof__ on the field, NOT (off_t)/(blkcnt_t): bionic declares
+            // blkcnt_t `unsigned long` but struct stat's st_blocks signed, so a (blkcnt_t) cast is itself the
+            // narrowing NDK r30's clang 21 rejects (the 6.4.1 Android SDK build, 2026-10-20).
+            .st_size = (__typeof__(((struct stat *)0)->st_size))statx_buffer.stx_size,
             .st_blksize = statx_buffer.stx_blksize,
-            .st_blocks = (blkcnt_t)statx_buffer.stx_blocks,
+            .st_blocks = (__typeof__(((struct stat *)0)->st_blocks))statx_buffer.stx_blocks,
             .st_atim = { .tv_sec = statx_buffer.stx_atime.tv_sec, .tv_nsec = statx_buffer.stx_atime.tv_nsec },
             .st_mtim = { .tv_sec = statx_buffer.stx_mtime.tv_sec, .tv_nsec = statx_buffer.stx_mtime.tv_nsec },
             .st_ctim = { .tv_sec = statx_buffer.stx_ctime.tv_sec, .tv_nsec = statx_buffer.stx_ctime.tv_nsec },
