@@ -64,13 +64,7 @@
 #include <sys/stat.h>
 #endif
 
-// Harmony: `|| defined(__ANDROID__)` -- under WinCatalyst, Frameworks/include/posix/TargetConditionals.h shadows
-// CFTargetConditionals.h's own platform logic and never defines TARGET_OS_ANDROID, so on Android this header
-// took the generic Linux branch below. With NDK r30's headers that branch defines __NR_statx but cannot see
-// `struct statx`/STATX_* (bionic keeps them in linux/stat.h, PRIVATE in the Android modulemap -- this branch's
-// module import is the only way in): "definition of 'statx' must be imported from module
-// 'posix_filesystem.linux_stat'" building the CoreFoundation overlay (the 6.4.1 Android SDK, 2026-10-20).
-#if TARGET_OS_ANDROID || defined(__ANDROID__)
+#if TARGET_OS_ANDROID
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -547,7 +541,16 @@ static inline unsigned int _dev_minor(dev_t rdev) {
 
 
 #if TARGET_OS_LINUX
-#if defined(__NR_statx) && defined(_GNU_SOURCE)
+// Harmony: not on an Android build that reached the generic Linux include branch -- WinCatalyst's
+// Frameworks/include/posix/TargetConditionals.h shadows CFTargetConditionals.h and never defines
+// TARGET_OS_ANDROID, so its Android CF takes that branch. NDK r30's headers define __NR_statx there while
+// `struct statx`/STATX_* live in linux/stat.h, PRIVATE in the Android modulemap ("definition of 'statx' must be
+// imported from module 'posix_filesystem.linux_stat'", the CoreFoundation overlay, 2026-10-20). Importing that
+// submodule from this header is not the fix: CF's `export *` then re-exports linux/stat.h's S_IFMT/S_IFLNK and
+// every client that also sees Foundation's is "ambiguous use of 'S_IFMT'". This helper serves corelibs' Swift
+// FileManager, which that stack does not ship, so it takes the lstat() fallback below. Upstream's Android
+// (TARGET_OS_ANDROID 1) keeps the statx path.
+#if defined(__NR_statx) && defined(_GNU_SOURCE) && (TARGET_OS_ANDROID || !defined(__ANDROID__))
 
 // There is no glibc statx() function, it must be called using syscall().
 
