@@ -64,7 +64,13 @@
 #include <sys/stat.h>
 #endif
 
-#if TARGET_OS_ANDROID
+// Harmony: `|| defined(__ANDROID__)` -- under WinCatalyst, Frameworks/include/posix/TargetConditionals.h shadows
+// CFTargetConditionals.h's own platform logic and never defines TARGET_OS_ANDROID, so on Android this header
+// took the generic Linux branch below. With NDK r30's headers that branch defines __NR_statx but cannot see
+// `struct statx`/STATX_* (bionic keeps them in linux/stat.h, PRIVATE in the Android modulemap -- this branch's
+// module import is the only way in): "definition of 'statx' must be imported from module
+// 'posix_filesystem.linux_stat'" building the CoreFoundation overlay (the 6.4.1 Android SDK, 2026-10-20).
+#if TARGET_OS_ANDROID || defined(__ANDROID__)
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
