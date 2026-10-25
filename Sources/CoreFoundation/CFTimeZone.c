@@ -498,20 +498,55 @@ CF_INLINE void __CFEntzcode(int32_t value, unsigned char *bufp) {
     bufp[3] = (value >> 0) & 0xff;
 }
 
-static Boolean __CFParseTimeZoneData(CFAllocatorRef allocator, CFDataRef data, CFTZPeriod **tzpp, CFIndex *cntp) {
-    int32_t len, timecnt, typecnt, charcnt, idx, cnt;
-    const uint8_t *p, *timep, *typep, *ttisp, *charp;
-    CFStringRef *abbrs;
-    Boolean result = true;
+CF_INLINE int64_t __CFDetzcode64(const unsigned char *bufp) {
+    uint64_t result = 0;
+    for (int i = 0; i < 8; i++) result = (result << 8) | (bufp[i] & 0xff);
+    return (int64_t)result;
+}
 
-    p = CFDataGetBytePtr(data);
-    len = CFDataGetLength(data);
+static Boolean __CFParseTimeZoneDataBlock(CFAllocatorRef allocator, const uint8_t *p, int32_t len, int32_t timesize, CFTZPeriod **tzpp, CFIndex *cntp);
+
+// WinCatalyst: read the TZif v2+ block when there is one. A v2+ file is a v1 header + block with
+// 32-bit transition times, then a second header + block with 64-bit times (RFC 8536 3.1: a v2+
+// reader SHOULD ignore the v1 block). Android's tzdata ships every zone with an EMPTY v1 block
+// (America/New_York: 0 transitions, 1 type) and all 360 transitions in v2, so reading only v1 made
+// every DST zone on Android a single fixed offset -- New York at UTC-5 all year, no next transition.
+// A fat Debian/macOS file carries the same transitions in both blocks, so its periods do not change:
+// everything outside the period store's int32-seconds-from-2001 range clamps and is deduped below.
+// If the v2 block is absent or rejected, the v1 block is parsed exactly as before.
+static Boolean __CFParseTimeZoneData(CFAllocatorRef allocator, CFDataRef data, CFTZPeriod **tzpp, CFIndex *cntp) {
+    const uint8_t *p = CFDataGetBytePtr(data);
+    int32_t len = CFDataGetLength(data);
     if (len < (int32_t)sizeof(struct tzhead)) {
 	return false;
     }
-    
     if (!(p[0] == 'T' && p[1] == 'Z' && p[2] == 'i' && p[3] == 'f')) return false;  /* Don't parse without TZif at head of file */
-   
+
+    if (p[4] >= '2') {
+	const int32_t isutcnt = __CFDetzcode(p + 20), isstdcnt = __CFDetzcode(p + 24), leapcnt = __CFDetzcode(p + 28);
+	const int32_t timecnt = __CFDetzcode(p + 32), typecnt = __CFDetzcode(p + 36), charcnt = __CFDetzcode(p + 40);
+	const int32_t kMaxCount = 1 << 16;  // far above any real zone; keeps the size arithmetic in range
+	if (0 <= isutcnt && isutcnt < kMaxCount && 0 <= isstdcnt && isstdcnt < kMaxCount && 0 <= leapcnt && leapcnt < kMaxCount &&
+	    0 <= timecnt && timecnt < kMaxCount && 0 <= typecnt && typecnt < kMaxCount && 0 <= charcnt && charcnt < kMaxCount) {
+	    const int64_t v1len = (int64_t)sizeof(struct tzhead) + (int64_t)timecnt * 5 + (int64_t)typecnt * 6 + charcnt +
+	                          (int64_t)leapcnt * 8 + isstdcnt + isutcnt;
+	    const uint8_t *v2 = p + v1len;
+	    if (v1len + (int64_t)sizeof(struct tzhead) <= len && v2[0] == 'T' && v2[1] == 'Z' && v2[2] == 'i' && v2[3] == 'f' &&
+	        __CFParseTimeZoneDataBlock(allocator, v2, len - (int32_t)v1len, 8, tzpp, cntp)) {
+		return true;
+	    }
+	}
+    }
+    return __CFParseTimeZoneDataBlock(allocator, p, len, 4, tzpp, cntp);
+}
+
+// One TZif header + data block, whose transition times are `timesize` (4 or 8) bytes wide.
+static Boolean __CFParseTimeZoneDataBlock(CFAllocatorRef allocator, const uint8_t *p, int32_t len, int32_t timesize, CFTZPeriod **tzpp, CFIndex *cntp) {
+    int32_t timecnt, typecnt, charcnt, idx, cnt;
+    const uint8_t *timep, *typep, *ttisp, *charp;
+    CFStringRef *abbrs;
+    Boolean result = true;
+
     p += 20 + 4 + 4 + 4;	/* skip reserved, ttisgmtcnt, ttisstdcnt, leapcnt */
     timecnt = __CFDetzcode(p);
     p += 4;
@@ -527,11 +562,11 @@ static Boolean __CFParseTimeZoneData(CFAllocatorRef allocator, CFDataRef data, C
 	// security reasons and to reject potentially corrupt files
 	return false;
     }
-    if (len - (int32_t)sizeof(struct tzhead) < (4 + 1) * timecnt + (4 + 1 + 1) * typecnt + charcnt) {
+    if (len - (int32_t)sizeof(struct tzhead) < (timesize + 1) * timecnt + (4 + 1 + 1) * typecnt + charcnt) {
 	return false;
     }
     timep = p;
-    typep = timep + 4 * timecnt;
+    typep = timep + timesize * timecnt;
     ttisp = typep + timecnt;
     charp = ttisp + (4 + 1 + 1) * typecnt;
     cnt = (0 < timecnt) ? timecnt : 1;
@@ -548,12 +583,16 @@ static Boolean __CFParseTimeZoneData(CFAllocatorRef allocator, CFDataRef data, C
 	int32_t itime, offset;
 	uint8_t type, dst, abbridx;
 
-	at = (CFAbsoluteTime)(__CFDetzcode(timep) + 0.0) - kCFAbsoluteTimeIntervalSince1970;
+	// Read nothing when there are no transitions: `timep` then points at the type table (or
+	// past the block), and an 8-byte read there could run off the end of the data.
+	if (0 == timecnt) at = 0.0;
+	else if (8 == timesize) at = (CFAbsoluteTime)__CFDetzcode64(timep) - kCFAbsoluteTimeIntervalSince1970;
+	else at = (CFAbsoluteTime)(__CFDetzcode(timep) + 0.0) - kCFAbsoluteTimeIntervalSince1970;
 	if (0 == timecnt) itime = INT_MIN;
 	else if (at < (CFAbsoluteTime)INT_MIN) itime = INT_MIN;
 	else if ((CFAbsoluteTime)INT_MAX < at) itime = INT_MAX;
 	else itime = (int32_t)at;
-	timep += 4;	/* harmless if 0 == timecnt */
+	timep += timesize;	/* harmless if 0 == timecnt */
 	type = (0 < timecnt) ? (uint8_t)*typep++ : 0;
 	if (typecnt <= type) {
 	    result = false;
