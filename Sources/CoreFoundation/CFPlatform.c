@@ -389,6 +389,19 @@ static CFURLRef _CFCopyHomeDirURLForUser(const char *username, bool fallBackToHo
             }
         }
     }
+#if TARGET_OS_ANDROID
+    // WinCatalyst: on Android the LAUNCHER owns HOME, so for the current user it outranks the
+    // passwd entry. Bionic synthesizes that entry from the uid -- `/` for the adb shell uid -- and it
+    // is not a home anyone set: the APK host sets HOME to the app's files dir, and the nstest runner
+    // to a writable directory, and NSHomeDirectory() answered `/` regardless while the search paths
+    // (which read HOME) pointed somewhere else. CFFIXED_USER_HOME still wins, as everywhere.
+    if (!home && !username && !issetugid()) {
+        const char *homePath = __CFgetenv("HOME");
+        if (homePath && homePath[0] == '/') {
+            home = CFURLCreateFromFileSystemRepresentation(kCFAllocatorSystemDefault, (uint8_t *)homePath, strlen(homePath), true);
+        }
+    }
+#endif
     if (!home) {
         struct passwd *upwd = NULL;
         if (username) {
